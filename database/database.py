@@ -1,216 +1,272 @@
 """
 database/database.py
 
-Handles:
-- SQLite database connection
-- Database initialization
-- Table creation
-- Default account creation
+Database manager for the Home Expense Tracker.
+
+Responsibilities
+----------------
+- Create SQLite connection
+- Enable foreign keys
+- Enable WAL mode
+- Create database schema
+- Initialize default data
+- Provide transaction support
 """
 
 from __future__ import annotations
 
 import sqlite3
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Optional
+from typing import Generator
 
 
 class DatabaseManager:
-    """Manages the SQLite database."""
+    """Handles all SQLite database operations."""
 
     DATABASE_NAME = "expense_tracker.db"
 
     def __init__(self) -> None:
         self.database_path = Path(__file__).parent / self.DATABASE_NAME
-        self.connection: Optional[sqlite3.Connection] = None
+        self._initialize_database()
 
-    def connect(self) -> sqlite3.Connection:
+    # ==========================================================
+    # Connection
+    # ==========================================================
+
+    def get_connection(self) -> sqlite3.Connection:
         """
-        Create a database connection.
+        Create a new SQLite connection.
 
-        Returns:
-            sqlite3.Connection
+        A fresh connection is returned each time.
+        This avoids stale connections and makes the
+        application more reliable.
         """
-        if self.connection is None:
-            self.connection = sqlite3.connect(self.database_path)
-            self.connection.row_factory = sqlite3.Row
-            self.connection.execute("PRAGMA foreign_keys = ON;")
 
-        return self.connection
+        connection = sqlite3.connect(self.database_path)
 
-    def close(self) -> None:
-        """Close the database connection."""
-        if self.connection:
-            self.connection.close()
-            self.connection = None
+        connection.row_factory = sqlite3.Row
 
-    def initialize_database(self) -> None:
-        """Create all required database tables."""
-        conn = self.connect()
-        cursor = conn.cursor()
+        connection.execute("PRAGMA foreign_keys = ON;")
 
-        # ------------------------------------------------------------------
-        # Accounts
-        # ------------------------------------------------------------------
+        connection.execute("PRAGMA journal_mode = WAL;")
+
+        connection.execute("PRAGMA synchronous = NORMAL;")
+
+        return connection
+
+    # ==========================================================
+    # Context Manager
+    # ==========================================================
+
+    @contextmanager
+    def transaction(self) -> Generator[sqlite3.Connection, None, None]:
+        """
+        Execute database operations inside a transaction.
+
+        Automatically commits on success.
+
+        Automatically rolls back on failure.
+        """
+
+        connection = self.get_connection()
+
+        try:
+            yield connection
+
+            connection.commit()
+
+        except Exception:
+
+            connection.rollback()
+
+            raise
+
+        finally:
+
+            connection.close()
+
+    # ==========================================================
+    # Database Initialization
+    # ==========================================================
+
+    def _initialize_database(self) -> None:
+        """
+        Create tables, indexes and default data.
+        """
+
+        with self.transaction() as connection:
+
+            cursor = connection.cursor()
+
+            self._create_tables(cursor)
+
+            self._create_indexes(cursor)
+
+            self._insert_default_accounts(cursor)
+
+            self._insert_default_categories(cursor)
+
+    # ==========================================================
+    # Table Creation
+    # ==========================================================
+
+    def _create_tables(
+        self,
+        cursor: sqlite3.Cursor,
+    ) -> None:
+        """
+        Create all required tables.
+
+        Implemented in Part 2.
+        """
         cursor.execute(
             """
             CREATE TABLE IF NOT EXISTS accounts (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                account_name TEXT UNIQUE NOT NULL,
-                opening_balance REAL NOT NULL DEFAULT 0,
-                current_balance REAL NOT NULL DEFAULT 0,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                account_name     TEXT    NOT NULL UNIQUE,
+                opening_balance  REAL    NOT NULL DEFAULT 0.0,
+                current_balance  REAL    NOT NULL DEFAULT 0.0,
+                created_at       TEXT    NOT NULL DEFAULT (datetime('now'))
             );
             """
         )
 
-        # ------------------------------------------------------------------
-        # Income
-        # ------------------------------------------------------------------
-        cursor.execute(
-            """
-            CREATE TABLE IF NOT EXISTS income (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                income_date TEXT NOT NULL,
-                amount REAL NOT NULL CHECK(amount > 0),
-                source TEXT NOT NULL,
-                received_by TEXT NOT NULL,
-                account_id INTEGER NOT NULL,
-                description TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY(account_id)
-                    REFERENCES accounts(id)
-                    ON DELETE RESTRICT
-            );
-            """
-        )
-
-        # ------------------------------------------------------------------
-        # Expense Categories
-        # ------------------------------------------------------------------
         cursor.execute(
             """
             CREATE TABLE IF NOT EXISTS expense_categories (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                category_name TEXT UNIQUE NOT NULL
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                category_name TEXT    NOT NULL UNIQUE
             );
             """
         )
 
-        # ------------------------------------------------------------------
-        # Expenses
-        # ------------------------------------------------------------------
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS income (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                income_date TEXT    NOT NULL,
+                amount      REAL    NOT NULL,
+                source      TEXT    NOT NULL,
+                received_by TEXT    NOT NULL,
+                account_id  INTEGER NOT NULL REFERENCES accounts(id) ON DELETE RESTRICT,
+                description TEXT    NOT NULL DEFAULT '',
+                created_at  TEXT    NOT NULL DEFAULT (datetime('now'))
+            );
+            """
+        )
+
         cursor.execute(
             """
             CREATE TABLE IF NOT EXISTS expenses (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                expense_date TEXT NOT NULL,
-                amount REAL NOT NULL CHECK(amount > 0),
-                category_id INTEGER NOT NULL,
-                description TEXT,
-                paid_by TEXT NOT NULL,
-                account_id INTEGER NOT NULL,
-                payment_method TEXT NOT NULL,
-                notes TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY(category_id)
-                    REFERENCES expense_categories(id)
-                    ON DELETE RESTRICT,
-                FOREIGN KEY(account_id)
-                    REFERENCES accounts(id)
-                    ON DELETE RESTRICT
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                expense_date   TEXT    NOT NULL,
+                amount         REAL    NOT NULL,
+                category_id    INTEGER NOT NULL REFERENCES expense_categories(id) ON DELETE RESTRICT,
+                description    TEXT    NOT NULL DEFAULT '',
+                paid_by        TEXT    NOT NULL,
+                account_id     INTEGER NOT NULL REFERENCES accounts(id) ON DELETE RESTRICT,
+                payment_method TEXT    NOT NULL DEFAULT '',
+                notes          TEXT    NOT NULL DEFAULT '',
+                created_at     TEXT    NOT NULL DEFAULT (datetime('now'))
             );
             """
         )
 
-        conn.commit()
+    # ==========================================================
+    # Index Creation
+    # ==========================================================
 
-        self._insert_default_accounts()
-        self._insert_default_categories()
+    def _create_indexes(
+        self,
+        cursor: sqlite3.Cursor,
+    ) -> None:
+        """
+        Create useful indexes.
 
-    def _insert_default_accounts(self) -> None:
-        """Insert the four default bank accounts once."""
-        conn = self.connect()
-        cursor = conn.cursor()
+        Implemented in Part 3.
+        """
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_income_account_id  ON income(account_id);"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_income_date        ON income(income_date);"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_income_source      ON income(source);"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_income_received_by ON income(received_by);"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_expenses_account_id  ON expenses(account_id);"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_expenses_date        ON expenses(expense_date);"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_expenses_category_id ON expenses(category_id);"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_expenses_paid_by     ON expenses(paid_by);"
+        )
+
+    # ==========================================================
+    # Default Accounts
+    # ==========================================================
+
+    def _insert_default_accounts(
+        self,
+        cursor: sqlite3.Cursor,
+    ) -> None:
+        """
+        Insert the four bank accounts.
+
+        Implemented in Part 3.
+        """
+        from utils.constants import BANK_ACCOUNTS  # noqa: F401 – kept for traceability
 
         default_accounts = [
-            "My Canara Bank",
-            "Mom's Canara Bank",
-            "South Indian Bank",
-            "Indian Bank",
+            "My Canara Bank Account",
+            "Mom's Canara Bank Account",
+            "South Indian Bank Account",
+            "Indian Bank Account",
         ]
 
-        for account in default_accounts:
+        for account_name in default_accounts:
             cursor.execute(
                 """
-                INSERT OR IGNORE INTO accounts
-                (
-                    account_name,
-                    opening_balance,
-                    current_balance
-                )
-                VALUES (?, 0, 0);
+                INSERT OR IGNORE INTO accounts (account_name, opening_balance, current_balance)
+                VALUES (?, 0.0, 0.0);
                 """,
-                (account,),
+                (account_name,),
             )
 
-        conn.commit()
+    # ==========================================================
+    # Default Categories
+    # ==========================================================
 
-    def _insert_default_categories(self) -> None:
-        """Insert default expense categories."""
-        conn = self.connect()
-        cursor = conn.cursor()
+    def _insert_default_categories(
+        self,
+        cursor: sqlite3.Cursor,
+    ) -> None:
+        """
+        Insert default expense categories.
 
-        categories = [
-            "Groceries",
-            "Vegetables",
-            "Milk",
-            "Electricity",
-            "Water",
-            "Gas",
-            "Petrol",
-            "Internet",
-            "Mobile Recharge",
-            "House Rent",
-            "Medical",
-            "Education",
-            "Shopping",
-            "Entertainment",
-            "Travel",
-            "Gifts",
-            "Repairs",
-            "Miscellaneous",
-        ]
+        Implemented in Part 3.
+        """
+        from utils.constants import DEFAULT_EXPENSE_CATEGORIES
 
-        for category in categories:
+        for category_name in DEFAULT_EXPENSE_CATEGORIES:
             cursor.execute(
                 """
-                INSERT OR IGNORE INTO expense_categories
-                (category_name)
+                INSERT OR IGNORE INTO expense_categories (category_name)
                 VALUES (?);
                 """,
-                (category,),
+                (category_name,),
             )
 
-        conn.commit()
 
-
-# ----------------------------------------------------------------------
-# Singleton Database Instance
-# ----------------------------------------------------------------------
+# Singleton instance
 
 db = DatabaseManager()
-
-
-def initialize_database() -> None:
-    """
-    Initialize the database.
-
-    This function should be called once from main.py.
-    """
-    db.initialize_database()
-
-
-if __name__ == "__main__":
-    initialize_database()
-    print("Database initialized successfully.")
